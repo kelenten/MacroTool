@@ -1,0 +1,15 @@
+CREATE TABLE MacroDefinitions (
+    MacroName VARCHAR(255) PRIMARY KEY,
+    DefinitionParams TEXT,
+    MacroBody TEXT NOT NULL,
+    DefinitionLocation VARCHAR(255)
+);
+
+CREATE TABLE MacroExpansions (
+    ExpansionID INT AUTO_INCREMENT PRIMARY KEY,
+    MacroName VARCHAR(255),
+    ExpansionParams TEXT,
+    ExpansionLocation VARCHAR(255),
+    ExpandedBody TEXT NOT NULL,
+    FOREIGN KEY (MacroName) REFERENCES MacroDefinitions(MacroName)
+);
