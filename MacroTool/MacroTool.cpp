@@ -36,13 +36,88 @@
 #include <utility>
 
 #include "../TestTool/FilePreprocessor.cpp"
-#include "D:/LLVM/新建文件夹/json-develop/single_include/nlohmann/json.hpp"
+#include "D:/LLVM/jsoncpp/json-develop/single_include/nlohmann/json.hpp"
+#include "clang/Analysis/MacroExpansionContext.h"
+
+#include "clang/Format/Format.h"
+#include "llvm/Support/Allocator.h"
+#include "clang/Basic/IdentifierTable.h"
+#include "clang/Lex/PreprocessorOptions.h"
+
 
 using namespace clang;
 using namespace clang::tooling;
 using namespace llvm;
 
-std::vector<std::pair<std::string, clang::SourceRange>> macroExpansions;
+struct macroDef {
+    std::string MacroName;
+    std::string Macrobody;
+    std::string File;
+    unsigned Line;
+    unsigned Column;
+    bool IsFunctionLike;
+    bool IsDefined;
+    std::string Params;
+
+    // 构造函数
+    macroDef(const std::string& name, std::string body, const std::string& file, unsigned line, unsigned column, bool functionLike, bool defined, std::string params)
+        : MacroName(name), Macrobody(body), File(file), Line(line), Column(column), IsFunctionLike(functionLike), IsDefined(defined), Params(params) {}
+};
+
+struct macroExp {
+    std::string MacroName;
+    std::string ExpandedContent;
+    std::string File;
+    unsigned Line;
+    unsigned Column;
+    bool IsFunctionLike;
+    std::string Params;
+
+    // 构造函数
+    macroExp(const std::string& macroName, std::string expandedContent, const std::string& file,
+        unsigned line, unsigned column, bool isFunctionLike, std::string params)
+        : MacroName(macroName), ExpandedContent(expandedContent), File(file),
+        Line(line), Column(column), IsFunctionLike(isFunctionLike), Params(params) {}
+};
+
+std::vector<std::shared_ptr<macroDef>> definitions;
+std::vector<std::shared_ptr<macroExp>> expansions;
+
+// 函数将 macroDef 转换为 JSON 对象
+nlohmann::json macroDefToJson(const std::shared_ptr<macroDef>& def) {
+    nlohmann::json root;
+    root["MacroName"] = def->MacroName;
+    root["Macrobody"] = def->Macrobody;
+    root["File"] = def->File;
+    root["Line"] = def->Line;
+    root["Column"] = def->Column;
+    root["IsFunctionLike"] = def->IsFunctionLike;
+    root["IsDefined"] = def->IsDefined;
+    root["Params"] = def->Params;
+    return root;
+}
+
+// 函数将 macroExp 转换为 JSON 对象
+nlohmann::json macroExpToJson(const std::shared_ptr<macroExp>& exp) {
+    nlohmann::json root;
+    root["MacroName"] = exp->MacroName;
+    root["ExpandedContent"] = exp->ExpandedContent;
+    root["File"] = exp->File;
+    root["Line"] = exp->Line;
+    root["Column"] = exp->Column;
+    root["IsFunctionLike"] = exp->IsFunctionLike;
+    root["Params"] = exp->Params;
+    return root;
+}
+
+std::vector <std::shared_ptr<macroExp>> expansionText;
+std::vector<std::shared_ptr<macroDef>> definitonTest;
+bool compile;
+std::vector<std::pair<std::shared_ptr<macroDef>, clang::FileID>> defparams;
+std::vector<std::pair<std::shared_ptr<macroDef>, clang::FileID>> defbodys;
+std::vector<std::pair<std::shared_ptr<macroExp>, clang::FileID>> expparams;
+std::vector<std::pair<std::shared_ptr<macroExp>, clang::FileID>> expbodys;
+
 
 // 获取宏定义和宏展开的位置
 class MyPPCallbacks : public PPCallbacks {
@@ -50,34 +125,249 @@ public:
     explicit MyPPCallbacks(Preprocessor& PP) : SM(PP.getSourceManager()), PP(PP) {}
 
     void If(SourceLocation Loc, SourceRange ConditionRange, ConditionValueKind ConditionValue) override {
-        SourceLocation macroLoc = ConditionRange.getBegin();
-        if (SM.getFileID(Loc) == SM.getMainFileID() && macroLoc.isMacroID()) {
-            llvm::outs() << "#if defined\n";
-            llvm::outs() << "Loc " << SM.getSpellingLineNumber(Loc) << ":" << SM.getSpellingColumnNumber(Loc) << "    file:" << SM.getFilename(Loc) << "\n";
-            llvm::outs() << "Range:" << SM.getExpansionLineNumber(ConditionRange.getBegin()) << ":" << SM.getExpansionColumnNumber(ConditionRange.getBegin()) << "\n"
-                << "to :" << SM.getExpansionLineNumber(ConditionRange.getEnd()) << ":" << SM.getExpansionColumnNumber(ConditionRange.getEnd()) << "\n";
-            llvm::outs() << "ConditionValue: " << ConditionValue << "\n";
+        if (compile) {
+            SourceLocation macroLoc = ConditionRange.getBegin();
+            if (SM.getFileID(Loc) == SM.getMainFileID() && macroLoc.isMacroID()) {
+                llvm::outs() << "#if defined\n";
+                llvm::outs() << "Loc " << SM.getSpellingLineNumber(Loc) << ":" << SM.getSpellingColumnNumber(Loc) << "    file:" << SM.getFilename(Loc) << "\n";
+                llvm::outs() << "Range:" << SM.getExpansionLineNumber(ConditionRange.getBegin()) << ":" << SM.getExpansionColumnNumber(ConditionRange.getBegin()) << "\n"
+                    << "to :" << SM.getExpansionLineNumber(ConditionRange.getEnd()) << ":" << SM.getExpansionColumnNumber(ConditionRange.getEnd()) << "\n";
+                llvm::outs() << "ConditionValue: " << ConditionValue << "\n";
 
-            // TODO:当前仅仅能够使用单一的宏调用，多个宏调用无法分别显示展开结果，只能显示最终结果 1/0；同样的也无法适用于嵌套宏
-            Token TheTok{};
-            if (!PP.getRawToken(macroLoc, TheTok, true)) {
-                llvm::outs() << "Macro token at this location: " << PP.getSpelling(TheTok) << "\n";
+                // TODO:当前仅仅能够使用单一的宏调用，多个宏调用无法分别显示展开结果，只能显示最终结果 1/0；同样的也无法适用于嵌套宏
+                Token TheTok{};
+                if (!PP.getRawToken(macroLoc, TheTok, true)) {
+                    llvm::outs() << "Macro token at this location: " << PP.getSpelling(TheTok) << "\n";
+                }
+                else {
+                    llvm::outs() << "Failed to get token at macro expansion location.\n\n";
+                }
             }
-            else {
-                llvm::outs() << "Failed to get token at macro expansion location.\n\n";
+        }
+    }
+    
+    void MacroUndefined(const Token& MacroNameTok, const MacroDefinition& MD, const MacroDirective* Undef) override {
+        if (compile) {
+            SourceLocation Loc = MacroNameTok.getLocation();
+            if (Loc.isValid() && SM.getFileID(Loc) == SM.getMainFileID()) {
+                bool isDefined = false;
+
+                // 获取宏的名称
+                StringRef MacroName = MacroNameTok.getIdentifierInfo()->getName();
+                std::string macroNameStr = MacroName.str();
+
+                // 获取文件名
+                StringRef FileName = SM.getFilename(Loc);
+
+                // 获取行号和列号
+                unsigned Line = SM.getSpellingLineNumber(Loc);
+                unsigned Column = SM.getSpellingColumnNumber(Loc);
+
+                // 输出宏名称
+                llvm::outs() << "\nMacro Undefinition happened\nMacro name: " << MacroName << "\n";
+                // 位置信息
+                llvm::outs() << "defined at line:" << Line
+                    << " , column:" << Column
+                    << " , at file: " << FileName << "\n";
+
+                llvm::outs() << "\n";
+
+                std::string str = "";
+                auto def = std::make_shared<macroDef>(
+                    macroNameStr,
+                    str,
+                    FileName.str(),
+                    Line,
+                    Column,
+                    false,
+                    isDefined,
+                    str
+                );
+
+                definitions.emplace_back(def);
             }
+        }
+        
+    }
+    
+    void MacroDefined(const Token& MacroNameTok, const MacroDirective* MD) override {
+        if (compile) {
+            const MacroInfo* MI = MD->getMacroInfo();
+            SourceLocation Loc = MI->getDefinitionLoc();
+            if (Loc.isValid() && SM.getFileID(Loc) == SM.getMainFileID()) {
+                // 获取宏的名称
+                StringRef MacroName = MacroNameTok.getIdentifierInfo()->getName();
+                std::string macroNameStr = MacroName.str();
+                bool isDefined = true;
 
+                // 获取文件名
+                StringRef FileName = SM.getFilename(Loc);
 
+                // 获取行号和列号
+                unsigned Line = SM.getSpellingLineNumber(Loc);
+                unsigned Column = SM.getSpellingColumnNumber(Loc);
+
+                // 输出宏名称
+                llvm::outs() << "\nMacro definition happened\nMacro name: " << MacroName << "\n";
+
+                std::string params = "";
+                //输出宏定义的参数列表                       
+                if (MI->isFunctionLike()) {
+                    params += "(";
+                    unsigned NumParams = MI->getNumParams();
+                    llvm::outs() << "Macro parameters:";
+                    for (unsigned i = 0; i < NumParams; ++i) {
+                        const IdentifierInfo* Param = MI->params()[i];
+                        StringRef ParamName = Param->getName();
+                        //llvm::outs()  << ParamName << " ";
+                        params += ParamName.str();
+                        if (i != NumParams - 1) {
+                            //llvm::outs() << ",";
+                            params += ",";
+                        }
+
+                    }
+                    //llvm::outs() << " )\n";
+                    params += ")";
+                    llvm::outs() << params << "\n";
+                }
+
+                ArrayRef<Token> bodyTokens = MI->tokens();
+
+                // 输出宏体
+                llvm::outs() << "Macro body: ";
+                std::string macroBody;
+                for (const auto& Token : bodyTokens) {
+                    llvm::outs() << PP.getSpelling(Token) << " ";
+                    macroBody += PP.getSpelling(Token);
+                }
+
+                // 位置信息
+                llvm::outs() << "\n defined at line:" << Line
+                    << " , column:" << Column
+                    << " , at file: " << FileName << "\n";
+               
+                std::unique_ptr<llvm::MemoryBuffer> Buffer1 = llvm::MemoryBuffer::getMemBufferCopy(params);
+                clang::FileID FID1 = SM.createFileID(std::move(Buffer1), clang::SrcMgr::C_User);
+
+                PP.EnterSourceFile(FID1, nullptr, clang::SourceLocation());
+
+                std::unique_ptr<llvm::MemoryBuffer> Buffer2 = llvm::MemoryBuffer::getMemBufferCopy(macroBody);
+                clang::FileID FID2 = SM.createFileID(std::move(Buffer2), clang::SrcMgr::C_User);
+
+                PP.EnterSourceFile(FID2, nullptr, clang::SourceLocation());
+
+                std::string str = "";
+                auto def = std::make_shared<macroDef>(
+                    macroNameStr,
+                    str,
+                    FileName.str(),
+                    Line,
+                    Column,
+                    (MI->isFunctionLike()),
+                    isDefined,
+                    str
+                );
+                definitions.emplace_back(def);
+                defparams.emplace_back(def, FID1);
+                defbodys.emplace_back(def, FID2);
+            }
         }
     }
 
-    void MacroDefined(const Token& MacroNameTok, const MacroDirective* MD) override {
+    void MacroExpands(const Token& MacroNameTok, const MacroDefinition& MD, SourceRange Range, const MacroArgs* Args) override {
+        if (compile) {
+            SourceLocation Loc = Range.getBegin();
+            if (Loc.isValid() && SM.getFileID(SM.getExpansionLoc(SM.getTopMacroCallerLoc(Loc))) == SM.getMainFileID()) {
+                // 获取宏的名称
+                StringRef MacroName = MacroNameTok.getIdentifierInfo()->getName();
+                llvm::outs() << "\n\nMacro Expansion Happened\nMacro name: " << MacroName << "\n";
+                std::string macroNameStr = MacroName.str();
+
+                std::string original = macroNameStr;
+
+                std::string params = "";
+                //输出宏展开的参数列表                       
+                const MacroInfo* MI = MD.getMacroInfo();
+                if (MI->isFunctionLike()) {
+                    params += "(";
+                    unsigned NumParams = MI->getNumParams();
+                    llvm::outs() << "parameters: ";
+                    for (unsigned i = 0; i < NumParams; ++i) {
+                        params += printMacroArgument(Args, i, PP);
+                        if (i != NumParams - 1) {
+                            //llvm::outs() << ",";
+                            params += ",";
+                        }
+                    }
+                    //llvm::outs() << ")\n";
+                    params += ")";
+                    llvm::outs() << params << "\n";
+                    original += params;
+                }
+
+                // 获取文件名
+                StringRef FileName = SM.getFilename(SM.getSpellingLoc(Loc));
+                // 获取行号和列号
+                unsigned Line = SM.getExpansionLineNumber(Loc);
+                unsigned Column = SM.getExpansionColumnNumber(Loc);
+
+                llvm::outs() << "expended at line:" << Line
+                    << " , column:" << Column
+                    << " , at file: " << FileName << "\n";
+
+
+                std::unique_ptr<llvm::MemoryBuffer> Buffer1 = llvm::MemoryBuffer::getMemBufferCopy("\n" + params + "\n");
+                clang::FileID FID1 = SM.createFileID(std::move(Buffer1), clang::SrcMgr::C_User);
+
+                PP.EnterSourceFile(FID1, nullptr, clang::SourceLocation());
+
+                std::unique_ptr<llvm::MemoryBuffer> Buffer2 = llvm::MemoryBuffer::getMemBufferCopy("\n" + original   +   "\n");
+                clang::FileID FID2 = SM.createFileID(std::move(Buffer2), clang::SrcMgr::C_User);
+
+                PP.EnterSourceFile(FID2, nullptr, clang::SourceLocation());
+               
+
+                std::string str = "";
+                auto exp = std::make_shared<macroExp>(
+                    macroNameStr,
+                    str,
+                    FileName.str(),
+                    Line,
+                    Column,
+                    (MI->isFunctionLike()),
+                    str
+                );
+                expansions.emplace_back(exp);
+                expparams.emplace_back(exp, FID1);
+                expbodys.emplace_back(exp, FID2);
+            }
+        }
+    }
+
+private:
+    SourceManager& SM;
+    Preprocessor& PP;
+
+    static std::string printMacroArgument(const MacroArgs* Args, unsigned ArgIndex, Preprocessor& PP) {
+        if (!Args) return "";
+        Token const* ArgTokens = Args->getUnexpArgument(ArgIndex);
+        std::string ArgString;
+        llvm::raw_string_ostream ArgStream(ArgString);
+
+        for (const Token* T = ArgTokens; T && T->isNot(tok::eof); ++T) {
+            ArgStream << PP.getSpelling(*T);
+        }
+
+        return ArgStream.str();
+    }
+
+    void getmacroInfo(const Token& MacroNameTok, const MacroDirective* MD, bool isDefined) {
         const MacroInfo* MI = MD->getMacroInfo();
         SourceLocation Loc = MI->getDefinitionLoc();
         if (Loc.isValid() && SM.getFileID(Loc) == SM.getMainFileID()) {
             // 获取宏的名称
             StringRef MacroName = MacroNameTok.getIdentifierInfo()->getName();
-
             std::string macroNameStr = MacroName.str();
 
             // 获取文件名
@@ -110,10 +400,13 @@ public:
                 params += ")";
                 llvm::outs() << params << "\n";
             }
+
+            ArrayRef<Token> bodyTokens = MI->tokens();
+
             // 输出宏体
             llvm::outs() << "Macro body: ";
             std::string macroBody;
-            for (const auto& Token : MI->tokens()) {
+            for (const auto& Token : bodyTokens) {
                 llvm::outs() << PP.getSpelling(Token) << " ";
                 macroBody += PP.getSpelling(Token);
             }
@@ -125,66 +418,6 @@ public:
 
             llvm::outs() << "\n";
         }
-    }
-
-    void MacroExpands(const Token& MacroNameTok, const MacroDefinition& MD, SourceRange Range, const MacroArgs* Args) override {
-        
-        
-        SourceLocation Loc = Range.getBegin();
-
-        if (Loc.isValid() && SM.getFileID(SM.getSpellingLoc(Loc)) == SM.getMainFileID()) {
-            // 获取宏的名称
-            StringRef MacroName = MacroNameTok.getIdentifierInfo()->getName();
-            llvm::outs() << "\n\nMacro Expansion Happened\nMacro name: " << MacroName << "\n";
-            std::string macroNameStr = MacroName.str();
-
-            macroExpansions.push_back(std::make_pair(macroNameStr, Range));
-
-            //输出宏展开的参数列表                       
-            const MacroInfo* MI = MD.getMacroInfo();
-            if (MI->isFunctionLike()) {
-                std::string params = "(";
-                unsigned NumParams = MI->getNumParams();
-                llvm::outs() << "parameters: ";
-                for (unsigned i = 0; i < NumParams; ++i) {
-                    params += printMacroArgument(Args, i, PP);
-                    if (i != NumParams - 1) {
-                        //llvm::outs() << ",";
-                        params += ",";
-                    }
-                }
-                //llvm::outs() << ")\n";
-                params += ")";
-                llvm::outs() << params << "\n";
-            }
-
-            // 获取文件名
-            StringRef FileName = SM.getFilename(SM.getSpellingLoc(Loc));
-            // 获取行号和列号
-            unsigned Line = SM.getExpansionLineNumber(Loc);
-            unsigned Column = SM.getExpansionColumnNumber(Loc);
-
-            llvm::outs() << "expended at line:" << Line
-                << " , column:" << Column
-                << " , at file: " << FileName << "\n\n";
-        }
-    }
-
-private:
-    SourceManager& SM;
-    Preprocessor& PP;
-
-    static std::string printMacroArgument(const MacroArgs* Args, unsigned ArgIndex, Preprocessor& PP) {
-        if (!Args) return "";
-        Token const* ArgTokens = Args->getUnexpArgument(ArgIndex);
-        std::string ArgString;
-        llvm::raw_string_ostream ArgStream(ArgString);
-
-        for (const Token* T = ArgTokens; T && T->isNot(tok::eof); ++T) {
-            ArgStream << PP.getSpelling(*T);
-        }
-
-        return ArgStream.str();
     }
 };
 
@@ -258,162 +491,145 @@ public:
     void ExecuteAction() override {
         auto& CI = getCompilerInstance();
         auto& PP = CI.getPreprocessor();
-        SourceManager& SM = PP.getSourceManager();
+        auto& SM = PP.getSourceManager();
+        auto& LO = CI.getLangOpts();
 
-        CI.getPreprocessor().addPPCallbacks(std::make_unique<MyPPCallbacks>(CI.getPreprocessor()));
+        /*MacroExpansionContext recorder(LO);
+        recorder.registerForPreprocessor(PP);*/
+
+
+        std::unique_ptr<PPCallbacks> callbacks = std::make_unique<MyPPCallbacks>(CI.getPreprocessor());
+        PP.addPPCallbacks(std::move(callbacks));
         PP.EnterMainSourceFile();
 
-        std::vector<Token> tokens;
+        // 创建一个文件输出流
+        std::ofstream outFile("test1_pre.txt");
+        if (!outFile) {
+            std::cerr << "Error opening output file." << std::endl;
+            return;
+        }
 
-        Token Tok{};
+        compile = true;
+        clang::Token Tok{};
         PP.Lex(Tok);
 
         while (true) {
-            
+            SourceLocation Loc = Tok.getLocation();
+            outFile << PP.getSpelling(Tok) << ' ';
+            if (SM.isInMainFile(SM.getSpellingLoc(Loc))) {
+                
+            }
+            for (const auto& element : defparams) {
+                if (element.second == SM.getFileID(SM.getExpansionLoc(Loc))) {
+                    
+                    element.first->Params += PP.getSpelling(Tok);
+                    //llvm::outs() << PP.getSpelling(Tok);
+                }
+            }
+            for (const auto& element : defbodys) {
+                if (element.second == SM.getFileID(SM.getExpansionLoc(Loc))) {
+                    
+                    element.first->Macrobody += PP.getSpelling(Tok);
+                    //llvm::outs() << PP.getSpelling(Tok);
+                }
+            }
+            for (const auto& element : expparams) {
+                if (element.second == SM.getFileID(SM.getExpansionLoc(SM.getTopMacroCallerLoc(Loc)))) {
+                    
+                    element.first->Params += PP.getSpelling(Tok);
+                    //llvm::outs() << PP.getSpelling(Tok);
+                }
+            }
+            for (const auto& element : expbodys) {
+                if (element.second == SM.getFileID(SM.getExpansionLoc(SM.getTopMacroCallerLoc(Loc)))) {
+                    
+                    element.first->ExpandedContent += PP.getSpelling(Tok);
+                    //llvm::outs() << PP.getSpelling(Tok);
+                }
+            }
+
             
             if (Tok.is(tok::eof))
-                break;
-
-            SourceLocation Loc = Tok.getLocation();
-            SourceLocation SpellingLoc = SM.getSpellingLoc(Loc);
-            SourceLocation ExpansionLoc = SM.getExpansionLoc(Loc);
-
-            if (SM.getFileID(SpellingLoc) == SM.getMainFileID() && Loc.isMacroID()) {
-                tokens.push_back(Tok);
-                // 输出位置信息
-                /*llvm::outs() << "Location: " << SM.getPresumedLoc(Loc).getLine() << ":" << SM.getPresumedLoc(Loc).getColumn() << "\n";
-                llvm::outs() << "Spelling Location: " << SM.getPresumedLoc(SpellingLoc).getLine() << ":" << SM.getPresumedLoc(SpellingLoc).getColumn() << "\n";
-                llvm::outs() << "Expansion Location: " << SM.getPresumedLoc(ExpansionLoc).getLine() << ":" << SM.getPresumedLoc(ExpansionLoc).getColumn() << "\n";*/
-
-                // 获取宏展开的原始标识符 Token
-
-                
-
-                /*SourceLocation macroSL = SM.getImmediateMacroCallerLoc(ExpansionLoc);
-                llvm::outs() << "Location: " << SM.getPresumedLoc(macroSL).getLine() << ":" << SM.getPresumedLoc(macroSL).getColumn() << "\n";
-                
-                std::string macroName;
-                
-                llvm::outs() << "macroName: " << macroName << "\n";*/
-
-
-                /*nlohmann::json* macroJson = nullptr;  // 使用指针来存储可能的找到的对象的地址
-
-                auto it = jsonMap.find(macroName);
-                if (it != jsonMap.end()) {
-                    macroJson = &(it->second);  // 存储找到的对象的地址
-                }
-                else {
-                    jsonMap[macroName] = nlohmann::json{};
-                    macroJson = &(jsonMap[macroName]);
-                }
-
-                if ((*macroJson).contains("expansion body")) {
-                    std::string str = (*macroJson)["expansion body"];
-                    (*macroJson)["expansion body"] = str + PP.getSpelling(Tok);
-                }
-                else {
-                    (*macroJson)["expansion body"] = PP.getSpelling(Tok);
-                }
-                */
-                /*
-                auto [it, inserted] = jsonMap.insert_or_assign(macroName, nlohmann::json{});
-
-                // 使用引用直接操作 json 对象
-                nlohmann::json& macroJson = it->second;
-                // 检查 "expansion body" 键是否存在
-                if (macroJson.contains("expansion body")) {
-                    macroJson["expansion body"] += PP.getSpelling(Tok);  // 如果存在，则追加内容
-                }
-                else {
-                    macroJson["expansion body"] = PP.getSpelling(Tok);   // 如果不存在，初始化它
-                }
-                */
-
-               // llvm::outs() << PP.getSpelling(Tok) << "\n";
-            }
-
-            
-            PP.Lex(Tok);
+                break;           
+            PP.Lex(Tok);    
         }
-        llvm::outs() << "\n";
+        outFile.close();  // 关闭文件流
+        //for (std::pair<std::string, clang::SourceRange> expansion : macroExpansions) {
+        //    std::string macroName = expansion.first;
+        //    SourceRange range = expansion.second;
+
+        //    SourceLocation begin = range.getBegin();
+        //    SourceLocation end = range.getEnd();
+
+        //    llvm::outs() << "macroName : " << macroName << "\n";
+        //    
+        //    std::optional< StringRef > expansionText = recorder.getExpandedText(begin);
+        //    std::optional< StringRef > originalText = recorder.getOriginalText(begin);
+
+        //    if (expansionText) {
+        //        llvm::outs() << "Expanded macro: " << *expansionText << "\n";
+        //    }
+        //    if (originalText){
+        //        llvm::outs() << "originalText macro: " << *originalText << "\n\n";
+        //    }   
+        //}
 
 
-        for (std::pair<std::string, clang::SourceRange> expansion : macroExpansions) {
-            std::string macroName = expansion.first;
-            SourceRange range = expansion.second;
+        //for (const auto& exp : expansionText) {
+        //    std::string MacroName = exp->MacroName;
+        //    llvm::outs() << "!!macroName: " << MacroName << "\n";
+        //    std::string Code = exp->ExpandedContent;
+        //    std::unique_ptr<llvm::MemoryBuffer> Buffer = llvm::MemoryBuffer::getMemBufferCopy(Code);
+        //    clang::FileID FID = SM.createFileID(std::move(Buffer), clang::SrcMgr::C_User);
+        //    // 设置 Preprocessor 读取这个 FileID
+        //    PP.EnterSourceFile(FID, nullptr, clang::SourceLocation());
+        //    std::string expandedContent = "";
+        //    do {
+        //        PP.Lex(Tok);
+        //        if (PP.getSourceManager().isInMainFile(Tok.getLocation())) {
+        //            expandedContent += PP.getSpelling(Tok);
+        //            llvm::outs() << PP.getSpelling(Tok);
+        //        }
+        //    } while (Tok.isNot(clang::tok::eof));
+        //    llvm::outs() << "\n\n";
+        //    exp->ExpandedContent = expandedContent;
+        //} 
 
-            llvm::outs() << "macroName : " << macroName << "\n";
-            llvm::outs() << "Spelling range : " << SM.getSpellingLineNumber(range.getBegin())
-                << " : " << SM.getSpellingColumnNumber(range.getBegin()) << "\n"
-                << "to : " << SM.getSpellingLineNumber(range.getEnd())
-                << " : " << SM.getSpellingColumnNumber(range.getEnd()) << "\n\n";
-            for (Token token : tokens) {
-                SourceLocation Loc = token.getLocation();
-                SourceLocation SpellingLoc = SM.getSpellingLoc(Loc);
-                SourceLocation ExpansionLoc = SM.getExpansionLoc(Loc);
-
-                /*llvm::outs() << "Loc : " << SM.getSpellingLineNumber(Loc)
-                    << " : " << SM.getSpellingColumnNumber(Loc) << "\n";
-                llvm::outs() << "SpellingLoc : " << SM.getSpellingLineNumber(SpellingLoc)
-                    << " : " << SM.getSpellingColumnNumber(SpellingLoc) << "\n";
-                llvm::outs() << "ExpansionLoc : " << SM.getSpellingLineNumber(ExpansionLoc)
-                    << " : " << SM.getSpellingColumnNumber(ExpansionLoc) << "\n";
-                
-                llvm::outs() << token.getLiteralData() << "\n\n";*/
-
-
-                bool isInRange = !SM.isBeforeInTranslationUnit(ExpansionLoc, range.getBegin()) &&
-                    !SM.isBeforeInTranslationUnit(range.getEnd(), ExpansionLoc);
-
-                if (isInRange) {
-                    llvm::outs() << PP.getSpelling(Tok);
-                }
-            }
-            llvm::outs() << "\n";
-        }
-        
-
-        /*for (const auto& [key, value] : jsonMap) {
-            std::cout << "Key: " << key << "\n";
-            std::cout << "Value: " << value.dump(4) << "\n\n";
-        }*/
-    }
-
-    void EndSourceFileAction() override {
-        /* // 将 unordered_map 转换为 nlohmann::json 对象
-         nlohmann::json jsonObj;
-         for (const auto& [key, value] : jsonMap) {
-             jsonObj[key] = value;
-         }
-
-         // 将 json 对象写入到文件
-         std::ofstream outFile("output.json");
-         outFile << jsonObj.dump(4);  // 参数 4 是为了美观的缩进
-         outFile.close();*/
+        printDefinitions(definitions);
+        printExpansions(expansions);
     }
 
 private:
-    std::vector<std::string> traceMacroExpansion(SourceLocation Loc, SourceManager& SM, Preprocessor& PP) {
-        std::vector<std::string> names;
-        while (Loc.isMacroID()) {
-            SourceLocation MacroLoc = SM.getImmediateMacroCallerLoc(Loc);
-            std::string MacroName;
-            Token TheTok{};
-            if (!PP.getRawToken(MacroLoc, TheTok, true)) {
-                llvm::outs() << "Macro token at this location: " << PP.getSpelling(TheTok) << "\n";
-                MacroName = PP.getSpelling(TheTok);
-            }
-            else {
-                llvm::outs() << "Failed to get token at macro expansion location.\n\n";
-            }
-            names.push_back(MacroName);
-            Loc = SM.getImmediateSpellingLoc(MacroLoc);
+    void printDefinitions(const std::vector<std::shared_ptr<macroDef>>& definitions) {
+        std::cout << "Macro Definitions:" << std::endl;
+        for (const auto& defPtr : definitions) {
+            std::cout << "MacroName: " << defPtr->MacroName << std::endl;
+            std::cout << "Macrobody: " << defPtr->Macrobody << std::endl;
+            std::cout << "File: " << defPtr->File << std::endl;
+            std::cout << "Line: " << defPtr->Line << std::endl;
+            std::cout << "Column: " << defPtr->Column << std::endl;
+            std::cout << "IsFunctionLike: " << defPtr->IsFunctionLike << std::endl;
+            std::cout << "IsDefined: " << defPtr->IsDefined << std::endl;
+            std::cout << "Params: " << defPtr->Params << std::endl;
+            std::cout << "------------------------" << std::endl;
         }
-        std::reverse(names.begin(), names.end());
-        return names;
     }
 
+    void printExpansions(const std::vector<std::shared_ptr<macroExp>>& expansions) {
+        std::cout << "Macro Expansions:" << std::endl;
+        for (const auto& expPtr : expansions) {
+            if (expPtr) { // 确保指针有效
+                std::cout << "MacroName: " << expPtr->MacroName << std::endl;
+                std::cout << "ExpandedContent: " << expPtr->ExpandedContent << std::endl;
+                std::cout << "File: " << expPtr->File << std::endl;
+                std::cout << "Line: " << expPtr->Line << std::endl;
+                std::cout << "Column: " << expPtr->Column << std::endl;
+                std::cout << "IsFunctionLike: " << expPtr->IsFunctionLike << std::endl;
+                std::cout << "Params: " << expPtr->Params << std::endl;
+                std::cout << "------------------------" << std::endl;
+            }
+        }
+    }
 };
 
 static cl::OptionCategory MyToolCategory("My Tool Options");
@@ -428,5 +644,25 @@ int main(int argc, const char** argv) {
     CommonOptionsParser& OptionsParser = ExpectedParser.get();
 
     ClangTool Tool(OptionsParser.getCompilations(), OptionsParser.getSourcePathList());
-    return Tool.run(newFrontendActionFactory<PreprocessFrontendAction>().get());
+    Tool.run(newFrontendActionFactory<PreprocessFrontendAction>().get());
+
+    nlohmann::json defs;
+    nlohmann::json exps;
+    for (const auto& def : definitions) {
+        defs.push_back(macroDefToJson(def));
+    }
+    for (const auto& exp : expansions) {
+        exps.push_back(macroExpToJson(exp));
+    }
+    std::ofstream file1("definitions.json");
+    if (file1.is_open()) {
+        file1 << defs.dump(4);  
+        file1.close();
+    }
+    std::ofstream file2("expansions.json");
+    if (file2.is_open()) {
+        file2 << exps.dump(4);
+        file2.close();
+    }
+    return 0;
 }

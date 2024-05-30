@@ -11,8 +11,7 @@ endif()
 
 project ("MacroTool")
 
-# 自动生成compile-command.json
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 
 # 不知道要不要设置这个
 set(LLVM_ENABLE_PROJECTS clang;clang-tool-extra)
